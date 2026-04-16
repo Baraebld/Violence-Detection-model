@@ -1,0 +1,220 @@
+---
+1. MODEL LOADING
+
+- Model loading function: `src/load_model.py::load_trained_model`
+- File path used to locate the model file:
+  - `BASE_DIR = configs/config.py` resolves to the repository root
+  - `full_path = os.path.join(BASE_DIR, "models", model_path)`
+- Default model filename: `hybrid_model3.pth`
+- Weights are loaded using `model.load_state_dict(torch.load(full_path, map_location=device))`
+- `torch.load` loads the state dictionary from disk, and `load_state_dict` applies it to the model instance
+- Device selection logic:
+  - `device = "cuda" if torch.cuda.is_available() else "cpu"`
+  - The model is moved to the chosen device with `.to(device)` before evaluation
+- The returned values are `(model, device)`
+
+---
+2. MODEL ARCHITECTURE
+
+- Model class: `models/model.py::HybridVideoClassifier`
+- Backbone: `torchvision.models.video.r3d_18(pretrained=True)`
+  - `r3d_18` is a 3D ResNet-18 model for video data
+  - The backbone classifier is removed by setting `self.backbone.fc = nn.Identity()`
+
+- Freezing logic:
+  - If `freeze_backbone=True`, all backbone parameters are frozen by default
+  - If `fine_tune_layer4=True`, the last residual block `self.backbone.layer4` is unfrozen
+
+- Transformer details:
+  - Transformer encoder layer: `nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=8, batch_first=True)`
+  - Number of Transformer encoder layers: `num_layers=3`
+  - Hidden dimension: `hidden_dim=512`
+  - Number of attention heads: `nhead=8`
+  - Batch-first operation: `batch_first=True`
+
+- Classification head:
+  - `self.classifier = nn.Linear(hidden_dim, num_classes)`
+  - Default `num_classes=1`
+
+- Input shape and output shape:
+  - Input tensor shape expected by `forward`: `[B, F, C, H, W]`
+    - `B`: batch size
+    - `F`: number of frames
+    - `C`: channels (3)
+    - `H`: height (224)
+    - `W`: width (224)
+  - Inside forward: input is permuted to `[B, C, F, H, W]` to match 3D CNN input format
+  - Backbone output shape: `[B, 512]`
+  - Transformer intermediate shape: `[B, F, 512]`
+  - After temporal mean pooling: `[B, 512]`
+  - Final logits shape: `[B]`
+
+- Architecture summary:
+  1. Input: `[B, F, 3, 224, 224]`
+  2. Permute to `[B, 3, F, 224, 224]`
+  3. Pass through `r3d_18` backbone -> `[B, 512]`
+  4. Repeat features for each frame -> `[B, F, 512]`
+  5. Pass through 3-layer Transformer encoder -> `[B, F, 512]`
+  6. Mean pool across frames -> `[B, 512]`
+  7. Linear classifier -> `[B]` logits
+
+---
+3. INPUT FORMAT (VERY IMPORTANT)
+
+- Expected tensor shape: `[B, F, C, H, W]`
+- Number of frames required: `NUM_FRAMES = 8`
+- Image size: `FRAME_SIZE = (224, 224)`
+- Normalization used:
+  - Mean: `[0.485, 0.456, 0.406]`
+  - Std: `[0.229, 0.224, 0.225]`
+- Data type: `torch.float32`
+- The model receives normalized RGB frames in float32 format
+
+---
+4. PREPROCESSING PIPELINE
+
+- Preprocessing function: `src/video_utils.py::load_video_frames`
+- Steps in processing a video file located at `video_path`:
+  1. Initialize an empty list `frames = []`
+  2. Create a zero-valued last frame placeholder: `last_frame = np.zeros((resize[1], resize[0], 3), dtype=np.uint8)`
+  3. Open video with OpenCV: `cap = cv2.VideoCapture(video_path)`
+  4. If video cannot open or frame count is 0, return a zero tensor of shape `[num_frames, 3, H, W]`
+  5. Determine total frame count: `total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))`
+  6. Compute uniformly spaced frame indices with `np.linspace(0, max(total_frames-1,0), num_frames).astype(int)`
+  7. Iterate over each selected frame index:
+     - Seek to frame index: `cap.set(cv2.CAP_PROP_POS_FRAMES, idx)`
+     - Read frame: `ret, frame = cap.read()`
+     - If read fails, reuse `last_frame`
+     - If frame is grayscale: convert to RGB using `cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)`
+     - If frame has 3 channels: convert BGR to RGB using `cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`
+     - Resize frame to `FRAME_SIZE` using `cv2.resize(frame, resize)`
+     - On exception or invalid channels, use `last_frame`
+  8. Normalize:
+     - Convert pixel values to float32 and scale to `[0,1]`: `frame.astype(np.float32) / 255.0`
+     - Subtract ImageNet mean and divide by ImageNet std
+  9. Permute frame to channel-first format: `np.transpose(frame, (2,0,1))`
+  10. Append to list `frames`
+  11. Release video capture: `cap.release()`
+  12. Return `torch.tensor(np.array(frames), dtype=torch.float)` with shape `[F, 3, H, W]`
+
+- The function does not directly add a batch dimension; callers must use `.unsqueeze(0)` for a single video
+
+---
+5. INFERENCE PIPELINE
+
+- Main inference entry point: `app/app.py`
+- Inference flow:
+  1. On app start, call `load_trained_model()` from `src/load_model.py`
+     - Instantiates `HybridVideoClassifier(num_frames=NUM_FRAMES, num_classes=1, freeze_backbone=True)`
+     - Loads `hybrid_model3.pth` from `models/`
+     - Moves model to `device`
+     - Sets `model.eval()`
+  2. When user uploads a video, save it to a temporary file and set `video_path`
+  3. Load and preprocess video frames using `src/video_utils.py::load_video_frames(video_path)`
+     - Returns tensor `[F, 3, H, W]`
+  4. Add batch dimension: `.unsqueeze(0)` -> `[1, F, 3, H, W]`
+  5. Move tensor to device: `.to(device)`
+  6. Run forward pass inside `torch.no_grad()`:
+     - `output = model(video_tensor)` -> `[1]`
+  7. Post-process output:
+     - `prob = torch.sigmoid(output).item()`
+     - `violence_prob = prob * 100`
+     - `non_violence_prob = 100 - violence_prob`
+  8. Determine final label:
+     - If `violence_prob > 50`, label is violent
+     - Otherwise, label is non-violent
+
+- Function names and files:
+  - `app/app.py`: user-facing Streamlit inference script
+  - `src/load_model.py::load_trained_model`: loads model and weights
+  - `src/video_utils.py::load_video_frames`: video preprocessing
+  - `models/model.py::HybridVideoClassifier`: network definition
+
+---
+6. OUTPUT FORMAT
+
+- The model returns raw logits from `HybridVideoClassifier.forward`
+  - Output shape from model: `[B]`
+  - For a single video, shape is `[1]`
+- Inference code applies sigmoid to logits:
+  - `prob = torch.sigmoid(output).item()`
+- Final label decision:
+  - `violence_prob = prob * 100`
+  - Threshold = `50%`
+  - If `violence_prob > 50`, result = violent
+  - Else result = non-violent
+- Example output for a single video:
+  - Raw logits: `tensor([0.7])`
+  - Sigmoid probability: `0.668187...`
+  - Violence probability: `66.82%`
+  - Non-violence probability: `33.18%`
+  - Final label: violent
+
+---
+7. DEPENDENCIES
+
+- Required Python libraries:
+  - `torch`
+  - `torchvision`
+  - `opencv-python` (`cv2`)
+  - `numpy`
+  - `streamlit`
+- Versions are not explicitly pinned in code, but repository expects Python 3.10 in the Streamlit app metadata
+- GPU is optional but supported: `load_trained_model` uses CUDA if available
+  - If CUDA is unavailable, inference falls back to CPU
+- Inference does not require GPU, but runtime will be slower on CPU
+
+---
+8. FILE STRUCTURE FOR INFERENCE
+
+Files required for inference:
+- `models/hybrid_model3.pth` (model weights)
+- `app/app.py` (Streamlit inference application)
+- `src/load_model.py` (model loading helper)
+- `src/video_utils.py` (video preprocessing helper)
+- `models/model.py` (model architecture definition)
+- `configs/config.py` (frame count, frame size, normalization, base path)
+
+---
+9. HARD CONSTRAINTS / ASSUMPTIONS
+
+- Fixed number of frames: `NUM_FRAMES = 8`
+  - `load_video_frames` always samples exactly 8 frames from each input video
+- Fixed frame size: `224 x 224`
+- Input must be RGB frames; grayscale videos are converted to RGB automatically
+- If a frame cannot be read, the last successfully decoded frame is reused
+- The model expects a single batch dimension to be added externally for inference
+- The Transformer stage repeats the backbone feature vector across all frames, so temporal modeling is limited to repeated feature sequences rather than per-frame distinct features
+- Inference assumes `hybrid_model3.pth` exists in `models/` relative to project root
+- CPU-only inference is supported, but not optimized for HPC throughput
+
+---
+10. MINIMAL WORKING INFERENCE EXAMPLE
+
+```python
+import torch
+from src.load_model import load_trained_model
+from src.video_utils import load_video_frames
+
+# Load model and device
+model, device = load_trained_model()
+
+# Preprocess one video
+video_path = "path/to/video.mp4"
+video_tensor = load_video_frames(video_path).unsqueeze(0).to(device)
+
+# Run inference
+with torch.no_grad():
+    logits = model(video_tensor)
+    prob = torch.sigmoid(logits).item()
+
+# Final decision
+violence_prob = prob * 100
+non_violence_prob = 100 - violence_prob
+label = "violent" if violence_prob > 50 else "non-violent"
+
+print(f"Logits: {logits.item():.6f}")
+print(f"Violence probability: {violence_prob:.2f}%")
+print(f"Non-violence probability: {non_violence_prob:.2f}%")
+print(f"Predicted label: {label}")
+```
